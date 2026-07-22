@@ -27,6 +27,8 @@ I wanted these units to look identical so I purchased Waveshare displays.
 
 [Assembly photos](assembly-photos.html) from the prototype and the first "production" units installed at [PDX Hackerspace](https://pdxhackerspace.org/).
 
+A 3D-printable enclosure lives in [`enclosure/`](enclosure/) — OpenSCAD source plus ready-to-print STL and 3MF, sized for the Waveshare display and the quarter-size Adafruit perma-proto board.
+
 ## Build and flash
 
 Built with [ESPHome](https://esphome.io/) through the `make` targets in `firmware/`:
