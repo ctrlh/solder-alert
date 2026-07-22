@@ -1,0 +1,90 @@
+# Solder Alert — ESP32-S3 board entrypoint
+# (Waveshare ESP32-S3-Touch-LCD-1.47).
+#
+# Build this: `make BOARD=s3`. Common config lives in solder-alert-base.yaml;
+# the orientation source is the manual-select package (this board has no
+# IMU). See docs/firmware-plan-v2.0.md §4/§5.
+#
+# NOT yet verified on hardware — the pin map is schematic-derived
+# (v2.0 §4.1). Work through the v2.0 "S3 bring-up" checklist before relying
+# on it.
+
+substitutions:
+  name: solder-alert
+  friendly_name: "Solder Alert"
+  fw_version: "dev"
+
+  # --- S3 pin map (plan v2.0 §4.1, schematic-verified) ---
+  display_sck:  GPIO38
+  display_mosi: GPIO39
+  display_cs:   GPIO21
+  display_dc:   GPIO45   # NB: S3 strapping pin
+  display_rst:  GPIO40
+  display_bl:   GPIO46   # NB: S3 strapping pin
+  i2c_sda:   GPIO42
+  i2c_scl:   GPIO41
+  touch_int: GPIO48
+  touch_rst: GPIO47
+  # WS2812 strip — same logical GPIO7 as the C6 board (schematic-confirmed).
+  led_data: GPIO7
+  # BOOT button — factory-reset hold (base solder-alert-base.yaml). GPIO0 is
+  # the S3 BOOT strapping pin (board standard); read as a runtime input after
+  # boot. Schematic-standard but not yet hardware-verified (see file header).
+  boot_button: GPIO0
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_PM_ENABLE: y
+      CONFIG_PM_DFS_INIT_AUTO: y
+      CONFIG_FREERTOS_USE_TICKLESS_IDLE: y
+
+# 8 MB octal PSRAM (ESP32-S3R8). mode: octal is REQUIRED — the quad default
+# will not initialise the R8. Drop speed to 40MHz if it boot-loops (v2.0 §4.2).
+psram:
+  mode: octal
+  speed: 80MHz
+
+# The S3's native USB-C port is USB-Serial-JTAG. Route the logger there
+# so `make logs`/`run` see boot output over USB (the base leaves the UART
+# at the chip default, which on the S3 is UART0 on a TX pin the USB port
+# does not expose — hence a silent port). The C6 default already lands on
+# USB-Serial-JTAG, so this override stays board-local.
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+# =======================================================================
+# BRING-UP BENCH — DISABLED (uncomment the `interval:` block to re-enable).
+# A reusable board bring-up harness; kept, not deleted. Drives the §6
+# checks that need no network (client isolation blocks the web/API path):
+#   - times a full redraw for the "render ≪ 373 ms" item
+#   - auto-toggles the orientation select every 8 s so the manual-flip,
+#     forced-redraw immediacy, and both-orientation touch checks can be
+#     observed over USB while you watch the panel.
+# Verified on the S3 2026-07-19: render ~77 ms, flip immediate, zones OK.
+# =======================================================================
+# interval:
+#   - interval: 5s
+#     then:
+#       - lambda: |-
+#           uint32_t t0 = micros();
+#           id(main_display).update();
+#           ESP_LOGI("bench", "full redraw took %.2f ms", (micros() - t0) / 1000.0f);
+#   - interval: 8s
+#     then:
+#       - lambda: |-
+#           const char *next =
+#               (id(cfg_orientation).state == "USB up (flipped)")
+#                 ? "USB down (normal)" : "USB up (flipped)";
+#           ESP_LOGI("bench", "toggle orientation -> %s", next);
+#           auto call = id(cfg_orientation).make_call();
+#           call.set_option(next);
+#           call.perform();
+
+packages:
+  base: !include solder-alert-base.yaml
+  orientation: !include packages/orientation-manual.yaml

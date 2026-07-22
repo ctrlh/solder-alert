@@ -1,0 +1,258 @@
+blueprint:
+  name: Solder Alert Bridge
+  description: >
+    Bridges a Solder Alert Attention Device (AD) — an ESPHome device
+    published by this project — to a Home Assistant switch (typically
+    a smart plug driving a soldering iron).
+
+
+    The AD holds the on-timer, alert, and extend logic locally. This
+    blueprint is the seam between the AD's abstract "command_switch"
+    events and the real HA switch, and it feeds the switch's state
+    back to the AD.
+
+
+    Bidirectional wiring:
+
+
+    * When the AD taps "on" or "off" — or auto-fires an off on timer
+      expiry / boot safety / reconnect safety — it emits the
+      `esphome.solder_alert_command_switch` event with
+      `data.action = "on" | "off"`. This blueprint listens for that
+      and toggles the target switch.
+
+
+    * When the target switch's state changes (from *anywhere* — this
+      blueprint, HA UI, an external automation, physical control),
+      this blueprint calls the AD's `report_switch_state` action so
+      the AD's internal state machine can adopt the change.
+
+
+    * On Home Assistant startup, and whenever this automation
+      (re)loads, it also reports the target switch's identity and
+      current state to the AD so its `Target switch` and
+      `Commanded switch state` entities are populated correctly.
+
+
+    Setup:
+
+      1. Add the ESPHome Solder Alert device to HA (Settings ›
+         Devices & services › ESPHome).
+
+      2. Install this blueprint. HA's Import Blueprint dialog only
+         accepts a URL, so the simplest path is to drop the file
+         directly into your HA config folder:
+
+            <config>/blueprints/automation/solder-alert/solder-alert-bridge.yaml
+
+         (Any folder under `blueprints/automation/` works;
+         `solder-alert/` is the convention.) Home Assistant doesn't
+         constantly watch the filesystem, so to have it pick up the
+         new file either restart HA, or open Developer Tools › YAML
+         and click the reload item for automations / blueprints.
+
+      3. Create an automation from the blueprint (Settings ›
+         Automations & scenes › Blueprints › Solder Alert Bridge ›
+         Create automation). Pick the AD device, the target switch
+         entity, and the AD's "On-period expires at" sensor. The
+         AD-offline grace (30 s) and deadline backup margin (5 s) have
+         safe defaults — these arm HA to cut the switch on schedule even
+         if the AD crashes, loses power, or goes silent.
+
+      4. The AD's runtime page should transition out of the
+         no-go / OFFLINE overlay once the state is reported.
+
+      5. Safety: set the smart plug's power-on / power-restore state to
+         "off" (not "last" or "on"). If the plug powers back on by itself
+         after an outage, nothing is counting down. This blueprint's
+         HA-start safety cuts an un-supervised "on", but a plug that stays
+         off on restore avoids the window entirely.
+  domain: automation
+  input:
+    ad_device:
+      name: Solder Alert AD device
+      description: The ESPHome device published as `solder-alert`.
+      selector:
+        device:
+          filter:
+            - integration: esphome
+    target_switch:
+      name: Target switch
+      description: >
+        The HA switch entity the AD controls (a smart plug driving a
+        soldering iron, most typically).
+      selector:
+        entity:
+          filter:
+            - domain: switch
+    ad_expires_at:
+      name: AD on-period expiry sensor
+      description: >
+        The AD's "On-period expires at" sensor (the timestamp one). Lets HA
+        turn the switch off on schedule even if the AD goes offline.
+      selector:
+        entity:
+          filter:
+            - integration: esphome
+              domain: sensor
+              device_class: timestamp
+    offline_grace:
+      name: AD-offline grace period
+      description: >
+        Seconds the AD may be unreachable before HA turns the switch off
+        as a safety fallback. Long enough to ride out a WiFi roam or a
+        firmware reboot; short enough to protect an unattended iron.
+      default: 30
+      selector:
+        number:
+          min: 5
+          max: 300
+          unit_of_measurement: s
+          mode: box
+    deadline_margin:
+      name: Deadline backup margin
+      description: >
+        Seconds after the AD's reported deadline before HA's backup off
+        fires. Small — just enough that the AD's own off normally wins.
+      default: 5
+      selector:
+        number:
+          min: 0
+          max: 60
+          unit_of_measurement: s
+          mode: box
+
+mode: queued
+max: 10
+max_exceeded: silent
+
+variables:
+  ad_device_id: !input ad_device
+  target_switch: !input target_switch
+  # In variables: (not just trigger_variables:) so the Gap A boot-safety
+  # condition template below can read it.
+  ad_expires_at: !input ad_expires_at
+  # ESPHome registers device actions as services named
+  # `esphome.<slug>_<action>`. `device_attr(..., 'name')` returns the
+  # friendly name (e.g. "Solder Alert") — `slugify` lowercases and
+  # replaces spaces/hyphens with underscores in one step, giving us
+  # the correct slug ("solder_alert").
+  ad_service_prefix: >-
+    esphome.{{ device_attr(ad_device_id, 'name') | slugify }}
+
+# Trigger templates can't read the automation-level `variables:` block, so
+# expose the inputs the deadline_backup template needs here instead.
+trigger_variables:
+  ad_expires_at: !input ad_expires_at
+  deadline_margin: !input deadline_margin
+
+trigger:
+  - platform: state
+    entity_id: !input target_switch
+    id: target_state_change
+  - platform: event
+    event_type: esphome.solder_alert_command_switch
+    id: ad_command
+  - platform: homeassistant
+    event: start
+    id: ha_start
+  - platform: event
+    event_type: automation_reloaded
+    id: ha_start
+  # Safety backup: the AD's reported deadline has passed (plus a small
+  # margin) while the AD is online but failed to send its own off.
+  # Re-evaluates on entity change and HA's ~1 min time tick, so it can lag
+  # the deadline by up to a minute — acceptable, since this only covers the
+  # rare "AD online yet mute" fault; the offline arm handles crash/power
+  # loss.
+  - platform: template
+    id: deadline_backup
+    value_template: >-
+      {% set e = states(ad_expires_at) %}
+      {{ e not in ['unknown', 'unavailable', '', 'none']
+         and now().timestamp() > as_timestamp(e) + (deadline_margin | int) }}
+  # Safety backup: the AD has been unreachable longer than the grace
+  # period (crash, power loss, prolonged WiFi drop).
+  - platform: state
+    entity_id: !input ad_expires_at
+    to: unavailable
+    for:
+      seconds: !input offline_grace
+    id: ad_offline
+
+action:
+  - choose:
+      # AD → HA: apply on/off to the target switch.
+      - conditions:
+          - condition: trigger
+            id: ad_command
+        sequence:
+          - service: "switch.turn_{{ trigger.event.data.action }}"
+            target:
+              entity_id: "{{ target_switch }}"
+
+      # HA → AD: target switch changed → push new state to AD.
+      - conditions:
+          - condition: trigger
+            id: target_state_change
+        sequence:
+          - service: "{{ ad_service_prefix }}_report_switch_state"
+            data:
+              state: >-
+                {% set s = trigger.to_state.state %}
+                {{ s if s in ['on', 'off'] else 'unavailable' }}
+
+      # Gap A — HA-side boot safety (plan v1.2 §7). On HA start / reload, if
+      # the target switch is on but the AD is NOT reporting an armed session
+      # (offline → 'unavailable', or online with no deadline → 'unknown'/''),
+      # cut it. Covers a smart plug that restored to "on" after a power or
+      # network outage with no supervisor. Ordered BEFORE the ha_start sync
+      # below so the deadline check runs before report_switch_state could
+      # make the AD adopt-on a stale "on"; the resulting off is pushed back
+      # to the AD via the target_state_change branch.
+      - conditions:
+          - condition: trigger
+            id: ha_start
+          - condition: state
+            entity_id: !input target_switch
+            state: "on"
+          - condition: template
+            value_template: >-
+              {{ states(ad_expires_at) in ['unknown', 'unavailable', '', 'none'] }}
+        sequence:
+          - service: switch.turn_off
+            target:
+              entity_id: !input target_switch
+
+      # HA startup / automation reload: sync target-switch identity
+      # and current state to the AD.
+      - conditions:
+          - condition: trigger
+            id: ha_start
+        sequence:
+          - service: "{{ ad_service_prefix }}_report_target_switch"
+            data:
+              entity_id: "{{ target_switch }}"
+          - service: "{{ ad_service_prefix }}_report_switch_state"
+            data:
+              state: >-
+                {% set s = states(target_switch) %}
+                {{ s if s in ['on', 'off'] else 'unavailable' }}
+
+      # Safety fallback (plan v1.2 §5.3): deadline reached with the AD
+      # mute, or the AD offline past the grace period. Cut the switch if
+      # it is still on. When the AD later returns, the target_state_change
+      # branch pushes the now-off state back and the AD adopts it — no
+      # loop, no special-casing.
+      - conditions:
+          - condition: trigger
+            id:
+              - deadline_backup
+              - ad_offline
+          - condition: state
+            entity_id: !input target_switch
+            state: "on"
+        sequence:
+          - service: switch.turn_off
+            target:
+              entity_id: !input target_switch

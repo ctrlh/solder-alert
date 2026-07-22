@@ -1,0 +1,283 @@
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Solder Alert — Build Log</title>
+  <style>
+    :root {
+      --bg:     #131510;   /* screen-off workbench */
+      --panel:  #1c1f18;   /* raised surface */
+      --line:   #33372c;   /* tinned-copper hairline */
+      --ink:    #e8e6dd;    /* warm off-white */
+      --muted:  #9a9c8f;    /* secondary label */
+      --glow:   #5af082;    /* the device's countdown green — Color(90,240,130) */
+      --rosin:  #d9a54a;    /* flux/rosin amber — the odd-one-out accent */
+      --mono:   ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+      --sans:   system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      --readout-gap: 1.1rem;   /* space between the frame number and the caption */
+      --meta-inset:  2rem;     /* caption column's right inset */
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: var(--sans);
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .wrap {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: clamp(1.25rem, 4vw, 3rem) clamp(1rem, 4vw, 2rem) 3rem;
+    }
+
+    /* ---- masthead ---- */
+    header { border-bottom: 1px solid var(--line); padding-bottom: 1.1rem; margin-bottom: 1.5rem; }
+    .kicker {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      letter-spacing: 0.34em;
+      text-transform: uppercase;
+      color: var(--glow);
+      margin: 0 0 0.55rem;
+    }
+    h1 {
+      font-family: var(--mono);
+      font-weight: 600;
+      font-size: clamp(1.5rem, 4.5vw, 2.3rem);
+      letter-spacing: -0.01em;
+      margin: 0;
+    }
+    .lede { color: var(--muted); margin: 0.5rem 0 0; font-size: 0.98rem; }
+
+    /* ---- stage ---- */
+    .stage {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      min-height: 46vh;
+    }
+    .stage img {
+      display: block;
+      max-width: 100%;
+      max-height: 68vh;
+      width: auto;
+      height: auto;
+      transition: opacity 0.32s ease;
+    }
+    .stage.loading img { opacity: 0.28; }
+
+    /* ---- readout + caption ---- */
+    .readout {
+      display: flex;
+      gap: var(--readout-gap);
+      align-items: baseline;
+      margin: 1.2rem 0 0.15rem;
+      padding-top: 1.15rem;
+    }
+    .frame {
+      font-family: var(--mono);
+      font-variant-numeric: tabular-nums;
+      line-height: 1;
+      white-space: nowrap;
+      flex: none;
+    }
+    .frame .n {
+      font-size: 2.1rem;
+      font-weight: 600;
+      color: var(--glow);
+      text-shadow: 0 0 22px rgba(90, 240, 130, 0.4);
+    }
+    .frame.is-note .n { color: var(--rosin); text-shadow: 0 0 22px rgba(217, 165, 74, 0.4); }
+    .frame .of { font-size: 0.9rem; color: var(--muted); margin-left: 0.15rem; }
+
+    .meta { min-width: 0; flex: 1; padding-right: var(--meta-inset); }
+    .eyebrow {
+      font-family: var(--mono);
+      font-size: 0.66rem;
+      letter-spacing: 0.24em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin: 0 0 0.3rem;
+    }
+    .caption { margin: 0; font-size: 1.02rem; }
+
+    /* ---- contact strip ---- */
+    .strip {
+      display: flex;
+      gap: 0.55rem;
+      overflow-x: auto;
+      padding: 1.4rem 0 0.4rem;
+      margin-top: 1rem;
+      border-top: 1px solid var(--line);
+      scroll-snap-type: x proximity;
+      scrollbar-width: thin;
+      scrollbar-color: var(--line) transparent;
+    }
+    .strip::-webkit-scrollbar { height: 7px; }
+    .strip::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+
+    .thumb {
+      flex: 0 0 auto;
+      width: 84px;
+      height: 84px;
+      padding: 0;
+      border: 1px solid var(--line);
+      border-radius: 3px;
+      background: #0d0e0a;
+      overflow: hidden;
+      cursor: pointer;
+      scroll-snap-align: center;
+      position: relative;
+      opacity: 0.5;
+      transition: opacity 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+    .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .thumb:hover { opacity: 0.85; }
+    .thumb.active {
+      opacity: 1;
+      border-color: var(--glow);
+      box-shadow: 0 0 0 1px var(--glow), 0 0 16px rgba(90, 240, 130, 0.45);
+    }
+    .thumb.active.note {
+      border-color: var(--rosin);
+      box-shadow: 0 0 0 1px var(--rosin), 0 0 16px rgba(217, 165, 74, 0.45);
+    }
+    .thumb:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+
+    .hint { font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.12em; color: var(--muted); margin: 1rem 0 0; }
+    .hint kbd {
+      font-family: var(--mono);
+      border: 1px solid var(--line);
+      border-radius: 3px;
+      padding: 0.05em 0.4em;
+      color: var(--ink);
+    }
+
+    @media (max-width: 560px) {
+      .thumb { width: 64px; height: 64px; }
+      .frame .n { font-size: 1.7rem; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .stage img, .thumb { transition: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <p class="kicker">Solder Alert · Build Log</p>
+      <h1>Assembling the first unit</h1>
+      <p class="lede">A run of snapshots from building the first "production" Solder Alert, plus one note carried over from the C6 prototype.</p>
+    </header>
+
+    <div class="stage" id="stage">
+      <img id="hero" alt="">
+    </div>
+
+    <div class="readout">
+      <div class="frame" id="frame"><span class="n" id="frame-n"></span><span class="of" id="frame-of"></span></div>
+      <div class="meta">
+        <p class="eyebrow" id="eyebrow"></p>
+        <p class="caption" id="caption"></p>
+      </div>
+    </div>
+
+    <div class="strip" id="strip" role="listbox" aria-label="Build photos"></div>
+
+    <p class="hint">Click a frame &middot; or step with <kbd>&larr;</kbd> <kbd>&rarr;</kbd></p>
+  </div>
+
+  <script>
+    // Ordered build sequence, then the C6 prototype aside. Edit captions here.
+    const FRAMES = [
+      { name: "assembly-01", caption: "Everything except the Waveshare displays." },
+      { name: "assembly-02", caption: "Short wires connect the front and rear halves of the LED strip." },
+      { name: "assembly-03", caption: "Longer wires go to power and GPIO 7 — trimmed to length once the strip is glued to the PCB." },
+      { name: "assembly-04", caption: "Short segments that fit down the sides of the PCB." },
+      { name: "assembly-05", caption: "30 AWG wire-wrap, a.k.a. Kynar wire." },
+      { name: "assembly-06", caption: "Quality Adafruit PCBs." },
+      { name: "assembly-07", caption: "The case design I came up with." },
+      { name: "assembly-08", caption: "I messed up the first order and got an S3 without the pre-soldered pins. Unscrew the standoffs, carefully remove the display connector, solder the pins, reconnect the display, screw the standoffs back on — or spend the extra $1 and let the factory line do it." },
+      { name: "assembly-09", caption: "Molex wire strippers are highly recommended — they save a lot of frustration." },
+      { name: "assembly-10", caption: "Assembled mini-strips." },
+      { name: "assembly-11", caption: "Board layout, with pen marks for the Waveshare display pins (USB-C connector facing the bottom of the frame)." },
+      { name: "assembly-12", caption: "Front half done — the far end of the strip." },
+      { name: "assembly-13", caption: "Rear half done — the near end of the strip, at the Data-In connection." },
+      { name: "assembly-14", caption: "Power and data connected. Both strips share the same GPIO 7 signal." },
+      { name: "assembly-15", caption: "Display added." },
+      { name: "assembly-16", caption: "Wedged connector-first into the enclosure." },
+      { name: "assembly-17", caption: "Give it a good push to align it properly, then screw it together." },
+      { name: "wire-thickness", note: true, caption: "From the C6 prototype: plain 22 AWG hookup wire is a touch too thick to fit under the USB-C connector, so the standoffs don't sit flush against the PCB. If you use thicker wire, offset the other end of the display so it's level at both ends — it'll also project out the front of the enclosure by another half millimetre or so." },
+    ];
+
+    const stepTotal = FRAMES.filter(f => !f.note).length;
+    const stage   = document.getElementById("stage");
+    const hero    = document.getElementById("hero");
+    const strip   = document.getElementById("strip");
+    const frameEl = document.getElementById("frame");
+    const frameN  = document.getElementById("frame-n");
+    const frameOf = document.getElementById("frame-of");
+    const eyebrow = document.getElementById("eyebrow");
+    const caption = document.getElementById("caption");
+    let current = -1;
+
+    // Build the contact strip and stamp each step's ordinal.
+    let step = 0;
+    FRAMES.forEach((f, i) => {
+      f.ord = f.note ? "PS" : String(++step).padStart(2, "0");
+      const btn = document.createElement("button");
+      btn.className = "thumb" + (f.note ? " note" : "");
+      btn.setAttribute("role", "option");
+      btn.title = f.caption;
+      const img = document.createElement("img");
+      img.src = "assembly/thumb/" + f.name + ".webp";
+      img.alt = f.caption;
+      img.loading = "lazy";
+      btn.appendChild(img);
+      btn.addEventListener("click", () => show(i));
+      strip.appendChild(btn);
+      f.btn = btn;
+    });
+
+    function show(i) {
+      if (i < 0 || i >= FRAMES.length || i === current) return;
+      const f = FRAMES[i];
+      if (current >= 0) FRAMES[current].btn.classList.remove("active");
+      current = i;
+
+      stage.classList.add("loading");
+      const done = () => stage.classList.remove("loading");
+      hero.addEventListener("load", done, { once: true });
+      hero.addEventListener("error", done, { once: true });
+      hero.src = "assembly/full/" + f.name + ".webp";
+      hero.alt = f.caption;
+
+      frameEl.classList.toggle("is-note", !!f.note);
+      frameN.textContent = f.ord;
+      frameOf.textContent = f.note ? "" : "/ " + String(stepTotal).padStart(2, "0");
+      eyebrow.style.color = f.note ? "var(--rosin)" : "";
+      eyebrow.textContent = f.note ? "Prototype note · ESP32-C6" : "Build step";
+      caption.textContent = f.caption;
+
+      f.btn.classList.add("active");
+      f.btn.scrollIntoView({ block: "nearest", inline: "center",
+        behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+    }
+
+    document.addEventListener("keydown", e => {
+      if (e.key === "ArrowRight") { show(Math.min(current + 1, FRAMES.length - 1)); e.preventDefault(); }
+      else if (e.key === "ArrowLeft") { show(Math.max(current - 1, 0)); e.preventDefault(); }
+    });
+
+    show(0);
+  </script>
+</body>
+</html>

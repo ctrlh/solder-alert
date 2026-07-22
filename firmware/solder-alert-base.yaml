@@ -1,0 +1,1176 @@
+# Solder Alert — Attention Device firmware (shared base)
+#
+# Board-agnostic config shared by every board variant. Do NOT build this
+# file directly — build a board entrypoint (solder-alert-c6.yaml /
+# solder-alert-s3.yaml), which supplies the `substitutions:` pin map, the
+# `esp32:`/`psram:` blocks, and exactly one orientation package. See
+# docs/firmware-plan-v2.0.md §3.
+#
+# The orientation seam: this base owns the `orientation` global, the
+# `apply_orientation` script (global → set_rotation), and the on_touch
+# zone-swap. Each variant package supplies `refresh_orientation` (the
+# board-specific source: IMU accel on C6, manual select on S3), which the
+# base calls on boot and on wake.
+
+# Vertical UI zone boundaries (LOGICAL px, top-down) shared by the display
+# layout and the on_touch handler so the two can't drift. on_touch maps raw
+# touch.y into logical space (undoing the 180° display flip) before applying
+# these, so the bands need NOT be symmetric — they track the visual layout.
+substitutions:
+  zone_top_px: "104"   # logical y < this → top (countdown); also the extend button's top edge
+  zone_mid_px: "192"   # logical y < this → middle (extend); else bottom (power)
+
+esphome:
+  name: ${name}
+  # Append the last 3 MAC bytes to the node name (e.g. solder-alert-a1b2c3)
+  # so each physical board is a distinct ESPHome node / mDNS host. Without
+  # this, every board shares the name "solder-alert" and HA "migrates" the
+  # integration onto whichever board booted last instead of adding it as a
+  # new device. friendly_name is left un-suffixed (HA disambiguates devices
+  # by their unique node name, not the friendly label).
+  name_add_mac_suffix: true
+  friendly_name: ${friendly_name}
+  min_version: 2026.6.4
+  project:
+    name: ctrlh.solder-alert
+    version: "${fw_version}"
+  on_boot:
+    - priority: 200
+      then:
+        # Publish initial state entity values so HA sees real values
+        # instead of "unknown" until the state machine takes over.
+        - text_sensor.template.publish:
+            id: state_sensor
+            state: "boot"
+        - sensor.template.publish:
+            id: remaining_seconds
+            state: 0
+        # Clear any stale watchdog deadline so a reboot never leaves HA
+        # armed against an expiry from before the crash (plan v1.2 §4.4).
+        - text_sensor.template.publish:
+            id: on_period_expires_at
+            state: ""
+        - binary_sensor.template.publish:
+            id: display_on
+            state: true
+        # Assume the target switch is available and off until the
+        # blueprint tells us otherwise. Without these publishes we'd
+        # trip the OFFLINE overlay and the reconnect-safety off spam
+        # while no blueprint exists.
+        - binary_sensor.template.publish:
+            id: switch_available
+            state: true
+        - text_sensor.template.publish:
+            id: commanded_switch_state
+            state: "off"
+        - light.turn_on:
+            id: backlight
+            brightness: 80%
+        # Startup R/G/B LED test (plan §6). Gated by the "Startup LED
+        # test" switch so it can be silenced later without a reflash.
+        - if:
+            condition:
+              switch.is_on: cfg_startup_led_test
+            then:
+              - light.turn_on:
+                  id: led_strip
+                  brightness: 40%
+                  red: 1.0
+                  green: 0.0
+                  blue: 0.0
+                  transition_length: 0s
+              - delay: 500ms
+              - light.turn_on:
+                  id: led_strip
+                  brightness: 40%
+                  red: 0.0
+                  green: 1.0
+                  blue: 0.0
+                  transition_length: 0s
+              - delay: 500ms
+              - light.turn_on:
+                  id: led_strip
+                  brightness: 40%
+                  red: 0.0
+                  green: 0.0
+                  blue: 1.0
+                  transition_length: 0s
+              - delay: 500ms
+              - light.turn_off:
+                  id: led_strip
+                  transition_length: 0s
+        # Hand off to the state-driven addressable effect. Runs from
+        # here until reboot; per-state colors + timing live in the
+        # effect lambda in the light: block.
+        - light.turn_on:
+            id: led_strip
+            brightness: 100%
+            effect: state_effect
+        # Orientation seam (plan v2.0 §3.2). The board's variant package
+        # supplies refresh_orientation: it resolves the current
+        # orientation (IMU accel on C6, manual select on S3), stores it
+        # in the `orientation` global, and applies the runtime display
+        # flip via apply_orientation.
+        - script.execute: refresh_orientation
+
+external_components:
+  # AXS5106L touch — plan §2. (The QMI8658 IMU component moves to the
+  # C6 orientation package; the S3 board has no IMU.)
+  - source: github://widget/esphome-components
+    components: [axs5106]
+    # Update the git-cloned component at most daily instead of re-fetching on
+    # every build (0s). A pull when the cache is stale is plenty, and not
+    # touching the shared clone every build removes a race hazard for
+    # concurrent builds.
+    refresh: 1d
+
+logger:
+  # Bring-up: DEBUG globally so we catch component setup details.
+  # Config dump ([C] level) already prints at INFO, so the I2C scan
+  # shows without further tuning. Dial back once things are stable.
+  level: DEBUG
+
+api:
+  reboot_timeout: 0s
+  encryption:
+    key: !secret api_encryption_key
+  on_client_connected:
+    - logger.log:
+        format: "API client connected; current_state=%s"
+        args: ['id(current_state).c_str()']
+    # BOOT → READY transition (plan §4). Only runs on the FIRST API
+    # connect after boot; subsequent HA reconnects during normal
+    # operation must not fire the safety off-command again.
+    - if:
+        condition:
+          lambda: 'return id(current_state) == "boot";'
+        then:
+          - logger.log: "BOOT → READY: firing safety off + state transition"
+          # on_client_connected fires the moment the API session is
+          # established, but the blueprint's event trigger sometimes
+          # loses the very first event fired against a still-warming
+          # HA/automation loop. A short delay before the safety off
+          # gives the automation engine time to settle, so the fire
+          # actually causes the switch to turn off.
+          - delay: 1s
+          # Safety: unconditionally turn the external switch off on
+          # first boot, regardless of what state the blueprint
+          # reports it in.
+          - script.execute:
+              id: command_switch
+              action: "off"
+          - script.execute:
+              id: set_state
+              new_state: "ready"
+          - script.execute: reset_idle_timer
+          - globals.set:
+              id: splash_status
+              value: '"Ready"'
+          - component.update:
+              id: main_display
+          - delay: 1500ms
+          - display.page.show: page_runtime
+    # Reconnect safety (plan §4 OFFLINE overlay). If we think the
+    # switch should be off (state is ready/blanked) but the blueprint
+    # hasn't confirmed it as "off", fire the off-command now — this
+    # covers the case where the on-timer expired while HA was
+    # unreachable.
+    - if:
+        condition:
+          lambda: |-
+            const std::string &s = id(current_state);
+            const std::string &v = id(commanded_switch_state).state;
+            return s != "boot" && (s == "ready" || s == "blanked")
+                   && v != "off";
+        then:
+          - logger.log: "Reconnect safety: retrying off-command"
+          - script.execute:
+              id: command_switch
+              action: "off"
+
+  # Bridge pipes — blueprint → AD (plan §11).
+  actions:
+    # Blueprint reports the current state of the external switch.
+    # Values: "on" | "off" | "unavailable".
+    - action: report_switch_state
+      variables:
+        state: string
+      then:
+        - text_sensor.template.publish:
+            id: commanded_switch_state
+            state: !lambda 'return state;'
+        - binary_sensor.template.publish:
+            id: switch_available
+            state: !lambda 'return state != "unavailable";'
+
+    # Blueprint reports the entity_id of the HA switch it is
+    # bridging to (display / debug only).
+    - action: report_target_switch
+      variables:
+        entity_id: string
+      then:
+        - text_sensor.template.publish:
+            id: target_switch
+            state: !lambda 'return entity_id;'
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# ---------------------------------------------------------------------
+# Factory reset — two board-agnostic escape hatches back to an
+# unprovisioned device (wipes WiFi/OTA creds + all restore_value
+# prefs, then reboots to the captive portal):
+#   1. Power-cycle 5× within a 10 s window between cycles.
+#   2. Hold the BOOT button for 5 s (wired via the boot_button
+#      binary_sensor below → factory_reset_btn).
+# Board-blind: the BOOT-button GPIO comes from the ${boot_button}
+# substitution in each entrypoint (GPIO9 on C6, GPIO0 on S3).
+# ---------------------------------------------------------------------
+factory_reset:
+  resets_required: 5    # power-cycle this many times to wipe
+  max_delay: 10s        # window between cycles before the count resets
+
+# No baked WiFi credentials — user provisions via captive portal on
+# first boot / after WiFi settings are cleared (plan §10).
+wifi:
+  ap:
+    ssid: "Solder Alert Setup"
+    password: !secret ap_password
+  on_connect:
+    - globals.set:
+        id: splash_status
+        value: '"Connecting to\nHome Assistant..."'
+
+captive_portal:
+
+# Persist number/switch changes to flash on the next loop tick rather
+# than batching for 60 s. Our settings change rarely — flash wear
+# isn't a concern — and the device is the source of truth for HA.
+preferences:
+  flash_write_interval: 0s
+
+web_server:
+  version: 3
+
+globals:
+  # Splash-screen status line. Updated as WiFi + API connect, then the
+  # display flips to the runtime page.
+  - id: splash_status
+    type: std::string
+    restore_value: no
+    initial_value: '"Starting..."'
+  # Physical orientation, resolved by the board's refresh_orientation
+  # (accel read on C6, manual select on S3) at boot and on wake. Values:
+  # "down" (natural default — USB-end down) or "up". Drives both the
+  # display's runtime 180° flip (apply_orientation → set_rotation) and
+  # the touch-zone y remapping in on_touch. The touch panel is not
+  # hardware-rotated, so both keep reading this global to stay consistent.
+  - id: orientation
+    type: std::string
+    restore_value: no
+    initial_value: '"down"'
+
+  # State machine (plan §4). Values: "boot" / "ready" / "on" / "alert"
+  # / "blanked". OFFLINE is an overlay flag, not a discrete state.
+  - id: current_state
+    type: std::string
+    restore_value: no
+    initial_value: '"boot"'
+
+  # Idle timer (plan §4). Counts down from cfg_idle_min * 60 while in
+  # READY; expiry → BLANKED. Reset by touch or state transitions
+  # that enter READY.
+  - id: idle_seconds
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # On-timer (plan §4). Source of truth for the remaining_seconds
+  # sensor; decremented at 1 Hz while in ON/ALERT.
+  - id: remaining_secs
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # Frame counter used for the ALERT countdown pulse (plan §5).
+  # Incremented once per display render.
+  - id: pulse_frame
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+script:
+  # AD → blueprint (plan §11). Fires an HA event the blueprint listens
+  # for; blueprint performs the on/off on the target switch. `action`
+  # must be "on" or "off".
+  - id: command_switch
+    parameters:
+      action: string
+    then:
+      - homeassistant.event:
+          event: esphome.solder_alert_command_switch
+          data:
+            action: !lambda 'return action;'
+
+  # State transition helper (plan §4). Updates the global and the
+  # published text_sensor in one place so every transition stays
+  # consistent.
+  - id: set_state
+    parameters:
+      new_state: string
+    then:
+      - lambda: |-
+          id(current_state) = new_state;
+          id(state_sensor).publish_state(new_state);
+      - logger.log:
+          format: "state → %s"
+          args: ['new_state.c_str()']
+
+  # Idle timer reset (plan §4). Called on any user activity while
+  # READY, and on transitions that (re-)enter READY. Also restores
+  # full backlight brightness — if we were dimmed, activity brings
+  # us back to full.
+  - id: reset_idle_timer
+    then:
+      - lambda: 'id(idle_seconds) = (int)(id(cfg_idle_min).state * 60);'
+      - light.turn_on:
+          id: backlight
+          brightness: !lambda 'return id(cfg_display_brightness).state / 100.0f;'
+          transition_length: 400ms
+
+  # BLANKED transition (plan §4): backlight off, front LEDs off,
+  # display_on false. Rear ambiance stays on (LED anims task will
+  # wire that).
+  - id: blank_display
+    then:
+      - script.execute:
+          id: set_state
+          new_state: "blanked"
+      - light.turn_off:
+          id: backlight
+      - binary_sensor.template.publish:
+          id: display_on
+          state: false
+      # TODO(plan §6): switch front LEDs off + rear to ambiance.
+
+  # Start / restart the on-timer from cfg_on_time_min (plan §4).
+  # Called on READY → ON and on each successful extend.
+  - id: start_on_timer
+    then:
+      - lambda: |-
+          int seconds = (int)(id(cfg_on_time_min).state * 60);
+          id(remaining_secs) = seconds;
+          id(remaining_seconds).publish_state(seconds);
+      - script.execute: publish_expires_at
+
+  # HA watchdog deadline publisher (plan v1.2 §4.3). Publishes the ISO-8601
+  # UTC instant the current on-timer expires, or "" when nothing is armed,
+  # to on_period_expires_at. Called only on timer start/extend/off/boot —
+  # not every 1 Hz tick — so bus traffic stays low. The blueprint uses this
+  # to cut the switch on schedule even if the AD goes offline.
+  - id: publish_expires_at
+    then:
+      - lambda: |-
+          if (id(remaining_secs) > 0 && id(ha_time).now().is_valid()) {
+            time_t epoch = id(ha_time).now().timestamp + id(remaining_secs);
+            char buf[32];
+            strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S+00:00",
+                     gmtime(&epoch));
+            id(on_period_expires_at).publish_state(buf);
+          } else {
+            id(on_period_expires_at).publish_state("");
+          }
+
+  # Local state adoption (plan §4). Called by both the user-initiated
+  # transitions below AND the external-switch adoption path; the
+  # difference is whether we also fire command_switch. Keeping the
+  # local mutation separate lets us avoid echoing commands back to HA.
+  - id: adopt_on
+    then:
+      - script.execute:
+          id: set_state
+          new_state: "on"
+      - script.execute: start_on_timer
+
+  - id: adopt_off
+    then:
+      - script.execute:
+          id: set_state
+          new_state: "ready"
+      - lambda: |-
+          id(remaining_secs) = 0;
+          id(remaining_seconds).publish_state(0);
+      - script.execute: publish_expires_at
+      - script.execute: reset_idle_timer
+
+  # READY → ON (user tap or safety). Sends command + adopts locally.
+  - id: transition_to_on
+    then:
+      - script.execute:
+          id: command_switch
+          action: "on"
+      - script.execute: adopt_on
+
+  # ON/ALERT → READY (user tap, timer expiry). Sends command + adopts.
+  - id: transition_to_off
+    then:
+      - script.execute:
+          id: command_switch
+          action: "off"
+      - script.execute: adopt_off
+
+  # ON → ALERT (interval-driven when remaining ≤ alert period). Timer
+  # keeps counting down through the existing 1 Hz tick; only the
+  # state flips.
+  - id: transition_to_alert
+    then:
+      - script.execute:
+          id: set_state
+          new_state: "alert"
+
+  # ALERT + extend tap (plan §4). Adds cfg_extend_min * 60 seconds to
+  # remaining_secs and returns to ON. Multiple extends per cycle
+  # allowed — this just runs each time.
+  - id: extend_timer
+    then:
+      - lambda: |-
+          int add_secs = (int)(id(cfg_extend_min).state * 60);
+          id(remaining_secs) += add_secs;
+          id(remaining_seconds).publish_state(id(remaining_secs));
+      - script.execute: publish_expires_at
+      - script.execute:
+          id: set_state
+          new_state: "on"
+
+  # Dim backlight to 30 % (plan §5). Was called ~30 s before idle blank;
+  # dim-before-blank is disabled (single on->off transition instead), so
+  # this script is unused. Kept for easy re-enable alongside its call site
+  # in the 1 Hz tick.
+  # - id: backlight_dim
+  #   then:
+  #     - light.turn_on:
+  #         id: backlight
+  #         brightness: 30%
+  #         transition_length: 1s
+
+  # WAKE transition (plan §4): BLANKED → READY. Refreshes orientation,
+  # brings backlight back up, restarts the idle timer.
+  - id: wake_display
+    then:
+      - script.execute:
+          id: set_state
+          new_state: "ready"
+      - script.execute: refresh_orientation
+      - script.execute: reset_idle_timer
+      - light.turn_on:
+          id: backlight
+          brightness: !lambda 'return id(cfg_display_brightness).state / 100.0f;'
+      - binary_sensor.template.publish:
+          id: display_on
+          state: true
+
+  # Orientation seam (plan v2.0 §3.2). Applies the current `orientation`
+  # global to the display via mipi_spi hardware rotation (MADCTL). Each
+  # board's refresh_orientation sets the global then calls this. The
+  # on_touch zone-swap reads the same global; touch is NOT hardware-
+  # rotated, so the two stay consistent without double-flipping.
+  #
+  # NB: this is a lift of the set_rotation half of the old C6
+  # detect_orientation, plus the §3.2 forced immediate redraw. set_rotation
+  # only rewrites MADCTL; without a redraw the framebuffer keeps the old
+  # pixels until the next update_interval tick (~1 s). The component.update
+  # repaints at once, so a runtime orientation change (the S3 manual
+  # selector) flips the live display within a frame. On the C6 auto-detect
+  # path this fires at boot/wake where a repaint already happens, so it is
+  # a no-op there in practice.
+  - id: apply_orientation
+    then:
+      - lambda: |-
+          const bool up = id(orientation) == "up";
+          id(main_display).set_rotation(
+              up ? display::DISPLAY_ROTATION_180_DEGREES
+                 : display::DISPLAY_ROTATION_0_DEGREES);
+      - component.update: main_display
+
+i2c:
+  sda: ${i2c_sda}
+  scl: ${i2c_scl}
+  frequency: 400kHz
+  scan: true
+
+spi:
+  - id: display_spi
+    clk_pin: ${display_sck}
+    mosi_pin: ${display_mosi}
+    interface: hardware
+
+font:
+  # Placeholder bring-up fonts; final font choices are a plan §12 open
+  # item.
+  - file: "gfonts://Roboto@700"
+    id: font_big
+    size: 40
+  - file: "gfonts://Roboto@700"
+    id: font_small
+    size: 16
+  # Countdown display — big bold digits + colon + dash.
+  - file: "gfonts://Roboto@700"
+    id: font_countdown
+    size: 56
+    glyphs:
+      - "0123456789: -"
+  # Button labels.
+  - file: "gfonts://Roboto@700"
+    id: font_button
+    size: 22
+
+# ---------------------------------------------------------------------
+# Display (plan §5, v1.2 migration). JD9853 driven via the mipi_spi
+# ST7789V preset with a 34-pixel horizontal offset for the 172-wide
+# panel on the 240-wide controller. Migrated from the deprecated
+# ili9xxx platform (v1.2) so the runtime 180° flip in apply_orientation
+# can call main_display.set_rotation() — ili9xxx kept the MADCTL rewrite
+# behind a private method.
+# ---------------------------------------------------------------------
+image:
+  # State-dependent power button graphics (plan v1.2 §8). Transparent PNGs
+  # (126x125) alpha-blended in the bottom touch zone: green power-on when
+  # the iron is ON, red power-off when OFF/READY, yellow NoGo when offline.
+  # RGB565 matches the panel's 16-bit color; alpha_channel keeps the round
+  # button's edges anti-aliased. FLOYDSTEINBERG dithering hides the banding
+  # that 16-bit quantization would otherwise show in the smooth gradient.
+  - file: images/btn-power-on.png
+    id: btn_power_on
+    type: RGB565
+    transparency: alpha_channel
+    dither: FLOYDSTEINBERG
+  - file: images/btn-power-off.png
+    id: btn_power_off
+    type: RGB565
+    transparency: alpha_channel
+    dither: FLOYDSTEINBERG
+  - file: images/btn-nogo.png
+    id: btn_nogo
+    type: RGB565
+    transparency: alpha_channel
+    dither: FLOYDSTEINBERG
+
+display:
+  - platform: mipi_spi
+    model: ST7789V
+    id: main_display
+    spi_id: display_spi
+    bus_mode: single
+    cs_pin: ${display_cs}
+    dc_pin: ${display_dc}
+    reset_pin: ${display_rst}
+    dimensions:
+      width: 172
+      height: 320
+      offset_height: 0
+      offset_width: 34
+    data_rate: 40MHz
+    color_order: bgr
+    # invert_colors: true was inverting on top of the JD9853's own
+    # inversion — background became white and RGB values were flipped.
+    # false restores expected color semantics.
+    invert_colors: false
+    # mipi_spi requires all three transform keys explicitly (ili9xxx
+    # defaulted the unset ones). mirror_x keeps the panel's native
+    # orientation; the runtime 180° flip is layered on top via
+    # set_rotation() in apply_orientation, not here.
+    transform:
+      mirror_x: true
+      mirror_y: false
+      swap_xy: false
+    # 1s keeps the main loop under the 30 ms component budget with
+    # margin. Bumping to 500 ms produced sporadic "operation took
+    # 200 ms (max 50 ms)" warnings on some boots — a full 172×320
+    # 16-bit blit + text render + SPI flush at ~40 MHz sits close to
+    # the limit and any transient jitter puts us over.
+    update_interval: 1s
+    pages:
+      # Splash — shown from boot until API client connects.
+      - id: page_splash
+        lambda: |-
+          it.fill(Color(0, 0, 0));
+          it.print(it.get_width() / 2, 30, id(font_big),
+                   Color(0, 255, 128), TextAlign::TOP_CENTER, "SOLDER");
+          it.print(it.get_width() / 2, 80, id(font_big),
+                   Color(0, 255, 128), TextAlign::TOP_CENTER, "ALERT");
+          it.print(it.get_width() / 2, 170, id(font_small),
+                   Color(255, 255, 255), TextAlign::TOP_CENTER,
+                   ESPHOME_PROJECT_VERSION);
+          // splash_status may contain a '\n' — render as two centered
+          // lines if so, one line if not.
+          {
+            const std::string &s = id(splash_status);
+            size_t nl = s.find('\n');
+            int cx = it.get_width() / 2;
+            if (nl == std::string::npos) {
+              it.print(cx, 240, id(font_small),
+                       Color(255, 255, 255),
+                       TextAlign::TOP_CENTER, s.c_str());
+            } else {
+              std::string a = s.substr(0, nl);
+              std::string b = s.substr(nl + 1);
+              it.print(cx, 225, id(font_small),
+                       Color(255, 255, 255),
+                       TextAlign::TOP_CENTER, a.c_str());
+              it.print(cx, 250, id(font_small),
+                       Color(255, 255, 255),
+                       TextAlign::TOP_CENTER, b.c_str());
+            }
+          }
+      # Runtime — 3-zone layout (plan §5). Top: countdown. Middle:
+      # power as an iOS-style app icon (filled green when ON,
+      # outlined gray otherwise). Bottom: extend button with lesser
+      # rounding.
+      - id: page_runtime
+        lambda: |-
+          it.fill(Color(0, 0, 0));
+          const int W = it.get_width();
+          const int cx = W / 2;
+          const std::string &state = id(current_state);
+          const bool active = (state == "on" || state == "alert");
+          const bool offline = !id(ha_connected).state
+                            || !id(switch_available).state;
+          // pulse_frame is advanced once per second by the 1 Hz tick, NOT
+          // here: on the no-PSRAM C6 this lambda re-runs once per render
+          // band, so incrementing here made the alert pulse colour depend on
+          // the band (vertical position) instead of time — the frame split
+          // top/bottom into the two pulse colours and never blinked.
+
+          // Filled rounded rectangle helper: solid interior + four
+          // rounded corners.
+          auto fill_rrect = [&](int x, int y, int w, int h, int r, Color c) {
+            it.filled_rectangle(x + r, y, w - 2 * r, h, c);
+            it.filled_rectangle(x, y + r, r, h - 2 * r, c);
+            it.filled_rectangle(x + w - r, y + r, r, h - 2 * r, c);
+            it.filled_circle(x + r, y + r, r, c);
+            it.filled_circle(x + w - r - 1, y + r, r, c);
+            it.filled_circle(x + r, y + h - r - 1, r, c);
+            it.filled_circle(x + w - r - 1, y + h - r - 1, r, c);
+          };
+          // Shadow color used behind filled buttons.
+          const Color SHADOW = Color(18, 22, 28);
+
+          // --- Top zone (y < zone_top_px): countdown ---
+          {
+            // ON: bright green (high G, R/B lifted for luminance) so the
+            // countdown stays legible. ALERT: pulse white/red once a second.
+            Color c = Color(255, 255, 255);
+            if (state == "on") {
+              c = Color(90, 240, 130);
+            } else if (state == "alert") {
+              c = (id(pulse_frame) % 2) ? Color(255, 255, 255)
+                                        : Color(255, 90, 90);
+            }
+            char buf[8];
+            if (active) {
+              int r = id(remaining_secs);
+              if (r >= 60) sprintf(buf, "%d:%02d", r / 60, r % 60);
+              else         sprintf(buf, "%d", r);
+            } else {
+              strcpy(buf, "--:--");
+            }
+            it.print(cx, 25, id(font_countdown), c,
+                     TextAlign::TOP_CENTER, buf);
+          }
+
+          // --- Middle zone (zone_top_px..zone_mid_px): extend button ---
+          {
+            const bool enabled = (state == "alert");
+            const int bx = 12;
+            // The extend button's top edge IS the top/middle touch boundary
+            // (zone_top_px), so the whole button sits in the middle zone and
+            // is fully tappable. zone_top_px is tuned for ~equal blank space
+            // above (to the countdown) and below (to the power image); moving
+            // it retunes the boundary and the button together.
+            const int by = ${zone_top_px};
+            const int bw = W - 24;
+            const int bh = 52;
+            const int r = 8;
+
+            if (enabled) {
+              // While ALERT is active, alternate the fill between
+              // amber and a similar-brightness green every render
+              // (~1 s) so the button visibly asks for attention.
+              const bool alt = (id(pulse_frame) % 2) == 0;
+              Color fill = alt ? Color(255, 190, 40)
+                               : Color( 80, 220, 60);
+              fill_rrect(bx + 2, by + 3, bw, bh, r, SHADOW);
+              fill_rrect(bx, by, bw, bh, r, fill);
+              it.print(cx, by + bh / 2 - 12, id(font_button),
+                       Color(20, 20, 20),
+                       TextAlign::TOP_CENTER, "EXTEND");
+            } else {
+              // Dull-gray border + gray interior + dull-gray label, so the
+              // disabled EXTEND button reads as inactive (not white/active).
+              fill_rrect(bx, by, bw, bh, r, Color(130, 130, 130));
+              fill_rrect(bx + 2, by + 2, bw - 4, bh - 4, r - 1,
+                         Color(100, 100, 100));
+              it.print(cx, by + bh / 2 - 12, id(font_button),
+                       Color(160, 160, 160),
+                       TextAlign::TOP_CENTER, "EXTEND");
+            }
+          }
+
+          // --- Bottom zone (y > zone_mid_px): power button image (§8) ---
+          // Replaces the hand-drawn app icon with the button PNGs: green
+          // power-on when the iron is ON, red power-off when OFF/READY,
+          // yellow NoGo when offline. Centered in the bottom zone (126x125);
+          // the zone boundaries (zone_top_px/zone_mid_px) are shared with
+          // on_touch so touch + graphics can't drift.
+          {
+            const int iy = (${zone_mid_px} + it.get_height()) / 2;
+            if (offline)
+              it.image(cx, iy, id(btn_nogo), ImageAlign::CENTER);
+            else if (active)
+              it.image(cx, iy, id(btn_power_on), ImageAlign::CENTER);
+            else
+              it.image(cx, iy, id(btn_power_off), ImageAlign::CENTER);
+          }
+
+# ---------------------------------------------------------------------
+# Backlight PWM (plan §5). LEDC drives an SS8050 NPN via 1 kΩ into
+# LEDK; PWM here controls brightness / dim / off.
+# ---------------------------------------------------------------------
+output:
+  - platform: ledc
+    id: backlight_output
+    pin: ${display_bl}
+    frequency: 20000Hz
+
+# ---------------------------------------------------------------------
+# Touch (plan §7). AXS5106L at I2C 0x63.
+# ---------------------------------------------------------------------
+touchscreen:
+  - platform: axs5106
+    id: touch
+    address: 0x63
+    interrupt_pin: ${touch_int}
+    reset_pin: ${touch_rst}
+    display: main_display
+    transform:
+      mirror_x: true
+    calibration:
+      # Observed raw ranges on this board (bring-up smoke): x ≈ 18–156,
+      # y ≈ 5–315. Chip returns x inverted (mirror_x above flips it).
+      x_min: 18
+      x_max: 156
+      y_min: 5
+      y_max: 315
+    on_touch:
+      # Touch dispatch (plan §4, §7). BLANKED taps wake the display
+      # and are otherwise consumed — no zone action fires. Non-
+      # blanked taps reset the idle timer and log their zone; the
+      # state-dependent zone action (power / extend) is wired in the
+      # next state-machine tasks.
+      - if:
+          condition:
+            lambda: 'return id(current_state) == "blanked";'
+          then:
+            - script.execute: wake_display
+          else:
+            - script.execute: reset_idle_timer
+            - lambda: |-
+                // Map raw touch.y into the display's LOGICAL y (the panel
+                // is hardware-rotated 180° when flipped; the touch panel is
+                // not), then apply the logical zone bands. This lets the
+                // bands be asymmetric and still resolve correctly in both
+                // orientations.
+                const bool flipped = id(orientation) == "up";
+                const int ly = flipped
+                    ? (id(main_display).get_height() - touch.y) : touch.y;
+                std::string zone = (ly < ${zone_top_px}) ? "top"
+                                 : (ly < ${zone_mid_px}) ? "middle" : "bottom";
+                ESP_LOGD("touch", "zone=%s (%d,%d)", zone.c_str(),
+                         touch.x, touch.y);
+                // OFFLINE overlay (plan §4): API down or the target
+                // switch is unavailable → power taps are ignored.
+                // Extend taps still work since they're purely local.
+                const bool offline = !id(ha_connected).state
+                                  || !id(switch_available).state;
+                const std::string &s = id(current_state);
+                // Layout swap: EXTEND lives in the middle zone,
+                // POWER lives in the bottom zone.
+                if (zone == "middle" && s == "alert") {
+                  id(extend_timer).execute();
+                } else if (zone == "bottom" && !offline) {
+                  if (s == "ready") {
+                    id(transition_to_on).execute();
+                  } else if (s == "on" || s == "alert") {
+                    id(transition_to_off).execute();
+                  }
+                }
+
+light:
+  # Display backlight (plan §5).
+  - platform: monochromatic
+    id: backlight
+    output: backlight_output
+    internal: true
+    default_transition_length: 200ms
+
+  # WS2812 strip — 12 pixels on GPIO7 (plan §6).
+  # Front pixels 0–5 alert-facing, rear 6–11 ambiance. The
+  # state_effect below drives them continuously; brightness scales
+  # against cfg_led_brightness.
+  - platform: esp32_rmt_led_strip
+    id: led_strip
+    pin: ${led_data}
+    num_leds: 12
+    rgb_order: GRB
+    chipset: WS2812
+    name: "LED strip"
+    internal: true
+    default_transition_length: 0s
+    effects:
+      - addressable_lambda:
+          name: state_effect
+          update_interval: 50ms
+          lambda: |-
+            const std::string &s = id(current_state);
+            const bool offline = !id(ha_connected).state
+                              || !id(switch_available).state;
+            float b = id(cfg_led_brightness).state / 100.0f;
+            if (b < 0.05f) b = 0.05f;
+            uint32_t t = millis();
+
+            auto set_pix = [&](int lo, int hi, Color c) {
+              for (int i = lo; i <= hi; i++) it[i] = c;
+            };
+            auto scale = [&](int v, float f) {
+              int r = (int)(v * f);
+              return r < 0 ? 0 : (r > 255 ? 255 : r);
+            };
+            // The warm READY orange, precomputed once as it appears
+            // in multiple states.
+            const auto READY_RGB = [](float k) {
+              int r = (int)(180 * k); if (r > 255) r = 255;
+              int g = (int)( 90 * k); if (g > 255) g = 255;
+              int bl = (int)( 25 * k); if (bl > 255) bl = 255;
+              return Color(r, g, bl);
+            };
+
+            // Pixel bank layout: indices 0-5 are the physical REAR
+            // half of the strip, 6-11 are the physical FRONT half.
+            // (Was labeled the opposite way earlier — the pixel
+            // *order* used by each state is unchanged from before
+            // except ALERT, which is explicitly swapped.)
+
+            // OFFLINE overlay wins (plan §6).
+            if (offline) {
+              set_pix(0, 5,  Color(scale(140, b), 0, 0));  // rear
+              set_pix(6, 11, Color(0, 0, 0));              // front
+              return;
+            }
+
+            if (s == "blanked") {
+              // Single pixel chases back and forth across the front
+              // bank (indices 6-11) over a 15 s round trip. Warm
+              // orange at 50 % of the READY brightness.
+              // Precomputed 10-position path avoids per-frame math.
+              static const uint8_t chase[10] =
+                {0, 1, 2, 3, 4, 5, 4, 3, 2, 1};
+              int step = (int)((t / 1500) % 10);
+              set_pix(0, 11, Color(0, 0, 0));
+              it[6 + chase[step]] = READY_RGB(b * 0.5f);
+            } else if (s == "ready") {
+              // Slow warm breath on both banks, 15 s period,
+              // 50 % brightness. Sampled every 50 ms → 300 samples
+              // per cycle so the transition reads as smooth.
+              float br = 0.5f + 0.5f * sinf(6.28318f * t / 15000.0f);
+              set_pix(0, 11, READY_RGB(b * 0.5f * br));
+            } else if (s == "on") {
+              // Rear (indices 1, 3, 5) — 80 % brightness pulse,
+              // 3.6 s period (slowed 3× per user tweak).
+              float pu_r = 0.7f + 0.3f * sinf(6.28318f * t / 3600.0f);
+              Color rear(scale(255, b * pu_r * 0.8f),
+                         scale( 95, b * pu_r * 0.8f), 0);
+              // Front (indices 7, 9, 11) — 12 s slow pulse.
+              float pu_f = 0.5f + 0.5f * sinf(6.28318f * t / 12000.0f);
+              Color front(scale(90, b * pu_f),
+                          scale(30, b * pu_f), 0);
+              set_pix(0, 11, Color(0, 0, 0));
+              it[1] = rear;  it[3] = rear;  it[5] = rear;
+              it[7] = front; it[9] = front; it[11] = front;
+            } else if (s == "alert") {
+              // Front (6-11): solid red, pulse dull ↔ bright (0.6 s).
+              float pu = 0.3f + 0.7f *
+                         (0.5f + 0.5f * sinf(6.28318f * t / 600.0f));
+              set_pix(6, 11, Color(scale(255, b * pu), 0, 0));
+              // Rear (0-5): red ↔ white flip, 500 ms per color.
+              bool white = ((int)(t / 500) % 2) == 0;
+              Color rear = white
+                ? Color(scale(200, b), scale(200, b), scale(200, b))
+                : Color(scale(200, b), 0, 0);
+              set_pix(0, 5, rear);
+            } else {
+              // Fallback (e.g., "boot"): dim warm.
+              set_pix(0, 11, Color(scale(60, b), scale(30, b), 0));
+            }
+
+interval:
+  # 1 Hz tick (plan §4). Drives:
+  #   - idle timer (READY): countdown, dim-before-blank, blank
+  #   - on-timer (ON/ALERT): countdown, ON→ALERT threshold, expiry
+  - interval: 1s
+    then:
+      - lambda: |-
+          // Advance the alert pulse once per second. Must change per frame,
+          // not per render band — the display lambda only reads it (see the
+          // note there).
+          id(pulse_frame)++;
+          const std::string &s = id(current_state);
+          if (s == "ready" && id(idle_seconds) > 0) {
+            id(idle_seconds)--;
+            // Dim-before-blank disabled: go straight from on to a single
+            // on->off transition at idle expiry (no intermediate 30 %
+            // dim stage). To restore, uncomment below + the backlight_dim
+            // script, and re-flash.
+            // int dim_at = (int)(id(cfg_idle_min).state * 60) - 30;
+            // if (dim_at > 0 && id(idle_seconds) == dim_at) {
+            //   id(backlight_dim).execute();
+            // }
+            if (id(idle_seconds) <= 0) {
+              id(blank_display).execute();
+            }
+          } else if ((s == "on" || s == "alert") && id(remaining_secs) > 0) {
+            id(remaining_secs)--;
+            id(remaining_seconds).publish_state(id(remaining_secs));
+            // ON → ALERT when we cross into the alert window. Guard
+            // by state so it only fires once per cycle.
+            int alert_at = (int)(id(cfg_alert_min).state * 60);
+            if (s == "on" && id(remaining_secs) <= alert_at) {
+              id(transition_to_alert).execute();
+            }
+            if (id(remaining_secs) <= 0) {
+              ESP_LOGD("timer", "on-timer expired → off");
+              id(transition_to_off).execute();
+            }
+          }
+
+# HA-slaved clock (plan v1.2 §4.1). homeassistant, not SNTP, so the AD and
+# HA agree on "now" — the published deadline needs no skew correction.
+time:
+  - platform: homeassistant
+    id: ha_time
+
+sensor:
+  # Runtime state — remaining seconds on the current on-timer.
+  # Published by the state machine; template so we can push values.
+  - platform: template
+    name: "Remaining"
+    id: remaining_seconds
+    unit_of_measurement: s
+    accuracy_decimals: 0
+    update_interval: never
+    icon: "mdi:timer-outline"
+
+text_sensor:
+  # Current state (plan §4): boot / blanked / ready / on / alert / offline.
+  - platform: template
+    name: "State"
+    id: state_sensor
+    update_interval: never
+    icon: "mdi:state-machine"
+
+  # Blueprint pipes (plan §3) — populated by the HA blueprint via
+  # ESPHome actions.
+  - platform: template
+    name: "Commanded switch state"
+    id: commanded_switch_state
+    update_interval: never
+    # External switch adoption (plan §4). When the blueprint reports
+    # a state change we haven't already commanded ourselves, mirror
+    # the change locally. adopt_on/adopt_off do NOT re-fire the
+    # command, so this can't loop with the AD → blueprint direction.
+    on_value:
+      - lambda: |-
+          const std::string &v = x;
+          const std::string &s = id(current_state);
+          if (v == "on") {
+            if (s == "blanked") id(wake_display).execute();
+            if (s != "on" && s != "alert") id(adopt_on).execute();
+          } else if (v == "off") {
+            if (s == "on" || s == "alert") id(adopt_off).execute();
+          }
+  - platform: template
+    name: "Target switch"
+    id: target_switch
+    update_interval: never
+
+  # HA watchdog deadline (plan v1.2 §4.2). ISO-8601 string, NOT a numeric
+  # sensor: ESPHome sensors are float32 and can't represent a Unix epoch to
+  # better than ~2 min. The blueprint parses this with as_timestamp().
+  # publish_expires_at sets it; "" (→ HA "unknown") when no timer is armed.
+  - platform: template
+    name: "On-period expires at"
+    id: on_period_expires_at
+    # timestamp device_class: HA renders the ISO string as a real datetime
+    # AND the blueprint's entity picker can filter to device_class:timestamp
+    # so this is the only match on the device. Idle publishes "" → HA shows
+    # it unknown.
+    device_class: timestamp
+    update_interval: never
+
+binary_sensor:
+  # HA connectivity — true when an API client is connected.
+  - platform: status
+    name: "HA connected"
+    id: ha_connected
+
+  # Display on/off — mirrors the backlight state (state machine sets).
+  - platform: template
+    name: "Display on"
+    id: display_on
+
+  # Target switch availability — populated by the blueprint via an
+  # ESPHome action (to be wired in the bridge task).
+  - platform: template
+    name: "Switch available"
+    id: switch_available
+
+  # BOOT button — held for 5 s triggers a factory reset (see the
+  # factory_reset: block above). No name → internal-only, not an HA
+  # entity. Active-low with pullup: pressed pulls the pin LOW, so
+  # inverted makes a press read as is_on. The pullup is applied after
+  # boot, so it does not fight the strapping-pin sampling at reset.
+  - platform: gpio
+    id: boot_button
+    pin:
+      number: ${boot_button}
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    on_press:
+      then:
+        - delay: 5s
+        - if:
+            condition:
+              binary_sensor.is_on: boot_button
+            then:
+              - button.press: factory_reset_btn
+
+# ---------------------------------------------------------------------
+# Configuration entities (plan §3). Persisted to flash via
+# restore_value; writes happen only when HA (or the local web UI)
+# changes a value, so the default flush cadence is fine.
+# ---------------------------------------------------------------------
+number:
+  - platform: template
+    name: "On-time"
+    id: cfg_on_time_min
+    unit_of_measurement: min
+    min_value: 1
+    max_value: 240
+    initial_value: 30
+    step: 1
+    optimistic: true
+    restore_value: true
+    mode: box
+
+  - platform: template
+    name: "Alert period"
+    id: cfg_alert_min
+    unit_of_measurement: min
+    min_value: 1
+    max_value: 60
+    initial_value: 3
+    step: 1
+    optimistic: true
+    restore_value: true
+    mode: box
+
+  - platform: template
+    name: "Extend period"
+    id: cfg_extend_min
+    unit_of_measurement: min
+    min_value: 1
+    max_value: 60
+    initial_value: 15
+    step: 1
+    optimistic: true
+    restore_value: true
+    mode: box
+
+  - platform: template
+    name: "Idle period"
+    id: cfg_idle_min
+    unit_of_measurement: min
+    min_value: 1
+    max_value: 60
+    initial_value: 5
+    step: 1
+    optimistic: true
+    restore_value: true
+    mode: box
+
+  - platform: template
+    name: "LED brightness"
+    id: cfg_led_brightness
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    initial_value: 50
+    step: 5
+    optimistic: true
+    restore_value: true
+    mode: slider
+
+  - platform: template
+    name: "Display brightness"
+    id: cfg_display_brightness
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    initial_value: 80
+    step: 5
+    optimistic: true
+    restore_value: true
+    mode: slider
+
+switch:
+  - platform: template
+    name: "Startup LED test"
+    id: cfg_startup_led_test
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+button:
+  # Internal button that performs the wipe. Pressed by the 5 s
+  # BOOT-button hold (boot_button binary_sensor). internal → not
+  # exposed to HA, so it can't be fired accidentally from a dashboard.
+  - platform: factory_reset
+    id: factory_reset_btn
+    internal: true
+
+# ---------------------------------------------------------------------
+# TODO(plan §3): state / read-only entities
+#   - text_sensor  state (boot/blanked/ready/on/alert/offline)
+#   - sensor       remaining_seconds     (runtime only, not persisted)
+#   - binary_sensor display_on, ha_connected, switch_available
+#   - text_sensor  target_switch  (populated by blueprint)
+# ---------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# TODO(plan §3): blueprint bridge pipes
+#   - text_sensor  commanded_switch_state  (blueprint → AD)
+#   - event emit   solder_alert.command_switch  (AD → blueprint)
+# ---------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# TODO(plan §4): state machine
+#   - BOOT → force off on API connect → READY
+#   - READY ↔ BLANKED via idle timer + touch wake
+#   - READY → ON via power tap; on-timer countdown
+#   - ON → ALERT at remaining ≤ alert period
+#   - ALERT extend tap; multiple extends allowed
+#   - Expiry → command off
+#   - External switch state adoption
+#   - OFFLINE overlay
+# ---------------------------------------------------------------------

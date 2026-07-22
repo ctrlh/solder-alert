@@ -1,0 +1,11 @@
+.esphome/
+firmware/.esphome/
+firmware/secrets.yaml
+firmware/build/
+dist/
+*.pyc
+__pycache__/
+.DS_Store
+
+# Claude Code per-user settings — personal, not shared
+.claude/settings.local.json

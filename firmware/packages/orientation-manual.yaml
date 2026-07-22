@@ -1,0 +1,33 @@
+# Orientation source — ESP32-S3 board (no IMU).
+#
+# The S3 board has no accelerometer, so orientation is a persisted manual
+# choice instead of auto-detected. Implements the same `refresh_orientation`
+# seam (plan v2.0 §5) the base calls on boot and on wake: map the selector
+# to the base's `orientation` global, then apply via apply_orientation.
+#
+# A runtime selector change flips the live display at once: the base
+# apply_orientation forces a redraw (component.update: main_display) after
+# set_rotation (plan v2.0 §3.2), so there is no wait for the next display
+# update_interval.
+
+select:
+  - platform: template
+    name: "Display orientation"
+    id: cfg_orientation
+    optimistic: true
+    restore_value: true
+    options:
+      - "USB down (normal)"
+      - "USB up (flipped)"
+    initial_option: "USB down (normal)"
+    on_value:
+      - script.execute: refresh_orientation
+
+script:
+  # Called by the base on boot and on wake, and by the selector on change.
+  - id: refresh_orientation
+    then:
+      - lambda: |-
+          id(orientation) =
+            (id(cfg_orientation).state == "USB up (flipped)") ? "up" : "down";
+      - script.execute: apply_orientation

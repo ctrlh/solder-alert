@@ -1,0 +1,51 @@
+# Solder Alert — ESP32-C6 board entrypoint
+# (Waveshare ESP32-C6-Touch-LCD-1.47).
+#
+# Build this: `make BOARD=c6` (default), or `esphome run solder-alert-c6.yaml`.
+# Common config lives in solder-alert-base.yaml; the orientation source is
+# the IMU package. See docs/firmware-plan-v2.0.md §3.
+
+substitutions:
+  name: solder-alert
+  friendly_name: "Solder Alert"
+  # Stamped at build time by the Makefile. Default "dev" when built directly.
+  fw_version: "dev"
+
+  # --- C6 pin map (plan v1.1 §1 / v2.0 §4.1, confirmed from schematic) ---
+  # Display (JD9853, driven as ST7789V; shares SPI bus with unused SD)
+  display_sck:  GPIO1
+  display_mosi: GPIO2
+  display_cs:   GPIO14
+  display_dc:   GPIO15
+  display_rst:  GPIO22
+  display_bl:   GPIO23   # backlight PWM → SS8050 NPN → LEDK
+  # Touch (AXS5106L) + IMU (QMI8658) on shared I2C bus
+  i2c_sda:   GPIO18
+  i2c_scl:   GPIO19
+  touch_int: GPIO21
+  touch_rst: GPIO20
+  imu_int1:  GPIO5
+  imu_int2:  GPIO6
+  # External WS2812 strip via H1 header. GPIO7 chosen because GPIO8/9 are
+  # ESP32-C6 strapping pins and GPIO9 also drives the BOOT button.
+  led_data: GPIO7
+  # BOOT button — factory-reset hold (base solder-alert-base.yaml). GPIO9
+  # is the C6 BOOT strapping pin; read as a runtime input after boot.
+  boot_button: GPIO9
+
+esp32:
+  board: esp32-c6-devkitc-1
+  variant: esp32c6
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+    # Automatic light sleep — plan §2. Touch INT wakes; WiFi stays
+    # connected via modem sleep.
+    sdkconfig_options:
+      CONFIG_PM_ENABLE: y
+      CONFIG_PM_DFS_INIT_AUTO: y
+      CONFIG_FREERTOS_USE_TICKLESS_IDLE: y
+
+packages:
+  base: !include solder-alert-base.yaml
+  orientation: !include packages/orientation-imu.yaml

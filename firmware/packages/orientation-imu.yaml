@@ -1,0 +1,47 @@
+# Orientation source — ESP32-C6 board (has a QMI8658 IMU).
+#
+# Implements the `refresh_orientation` seam (plan v2.0 §3.2): read accel
+# Y once, classify up/down, store in the base's `orientation` global,
+# then apply via the base's apply_orientation. Behaviourally identical to
+# the pre-v2.0 monolith's detect_orientation.
+
+external_components:
+  # QMI8658 IMU — plan §2.
+  - source: github://Djelibeybi/esphome-qmi8658
+    components: [qmi8658]
+
+# IMU (plan §5). QMI8658 at I2C 0x6B (verified by bus scan on real
+# hardware; the schematic net for SDO/SA0 was misread earlier). Polling
+# disabled — we trigger a single read at boot and on each wake, then
+# leave it idle.
+qmi8658:
+  - id: imu
+    address: 0x6B
+    update_interval: never
+
+sensor:
+  # IMU accel Y — the only channel we need (for orientation) (plan §5).
+  - platform: qmi8658
+    qmi8658_id: imu
+    accel_y:
+      id: accel_y
+      internal: true
+
+script:
+  # Called by the base on boot and on wake from BLANKED.
+  - id: refresh_orientation
+    then:
+      - component.update:
+          id: imu
+      - delay: 200ms
+      - lambda: |-
+          // Empirically calibrated on hardware: gravity pulls accel_y
+          // positive when the USB end is up. Any reading below the
+          // threshold (including near-flat) falls back to the "down"
+          // default.
+          float y = id(accel_y).state;
+          bool up = (y > 5.0);
+          id(orientation) = up ? "up" : "down";
+          ESP_LOGI("orient", "accel_y=%.2f → %s", y,
+                   id(orientation).c_str());
+      - script.execute: apply_orientation
